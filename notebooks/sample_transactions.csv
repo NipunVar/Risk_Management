@@ -1,0 +1,4 @@
+CustomerId,TransactionId,TransactionStartTime,Amount
+CUST_1,TXN_1,2024-10-01 12:00:00,100
+CUST_1,TXN_2,2024-10-03 14:30:00,-20
+CUST_2,TXN_3,2024-10-02 09:10:00,500
