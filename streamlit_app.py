@@ -17,6 +17,7 @@ import importlib.util
 import time
 from io import BytesIO
 import requests
+import json
 
 # -------------------------
 # Configuration / paths
@@ -148,13 +149,22 @@ def predict_from_transactions_csv(df_transactions: pd.DataFrame):
 # -------------------------
 # Sanitizer (avoid pyarrow conversion errors)
 # -------------------------
+def _to_json_safe(x):
+    try:
+        return json.dumps(x, default=str)
+    except Exception:
+        return str(x)
+
 def sanitize_df_for_display(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Make a copy of df that is safe to pass to st.dataframe / st.table (Arrow).
-    - Numeric-like columns (>=95% parseable as numbers) are converted to numeric dtype.
-    - Datetime-like columns are preserved.
-    - Categorical columns are converted to object first to avoid Category setitem errors.
-    - All other columns are converted to strings and NaNs -> empty string.
+    Stricter sanitizer that guarantees Arrow-compatible dtypes for display.
+
+    Rules:
+    - Numeric columns: only if *all* non-null values parse as numeric (no stray strings).
+    - Datetime/timedelta preserved when possible.
+    - Categorical -> object converted safely.
+    - Complex objects (list/dict/set) are JSON-serialized to strings.
+    - Any remaining object columns are converted to plain Python str with NaNs -> "".
     """
     if df is None:
         return df
@@ -164,55 +174,116 @@ def sanitize_df_for_display(df: pd.DataFrame) -> pd.DataFrame:
     for col in df2.columns:
         series = df2[col]
 
-        # If series is categorical, convert to object to avoid Category assignment issues
-        # (this prevents "Cannot setitem on a Categorical with a new category" errors)
-        if pd.api.types.is_categorical_dtype(series):
-            try:
-                series = series.astype(object)
-            except Exception:
-                # fallback: convert underlying values to strings
-                series = series.astype(str)
-            df2[col] = series  # write back the converted series so following logic uses non-categorical dtype
-            # reload the updated series object reference
-            series = df2[col]
+        # 1) Convert categorical to object safely (new recommended check)
+        try:
+            if isinstance(series.dtype, pd.CategoricalDtype):
+                try:
+                    series = series.astype(object)
+                except Exception:
+                    series = series.astype(str)
+                df2[col] = series
+                series = df2[col]
+        except Exception:
+            pass  # defensive
 
-        # Keep numeric dtypes numeric
+        # 2) If dtype is numeric already, coerce to numeric and continue
         if pd.api.types.is_numeric_dtype(series):
             df2[col] = pd.to_numeric(series, errors="coerce")
             continue
 
-        # Preserve datetime/timedelta types
+        # 3) Preserve datetime/timedelta when possible
         if pd.api.types.is_datetime64_any_dtype(series) or pd.api.types.is_timedelta64_dtype(series):
-            # Ensure consistent datetime dtype
             try:
                 df2[col] = pd.to_datetime(series, errors="coerce")
             except Exception:
                 pass
             continue
 
-        # Try converting to numeric: if most values parse, keep numeric
-        coerced = pd.to_numeric(series, errors="coerce")
-        num_parsable = int(coerced.notna().sum())
-        frac_parsable = num_parsable / max(1, len(coerced))
+        # 4) If the column contains complex Python objects (list/dict/set), JSON-serialize them
+        sample_has_complex = False
+        try:
+            non_null_sample = series.dropna().head(20).tolist()
+            for v in non_null_sample:
+                if isinstance(v, (list, dict, set)):
+                    sample_has_complex = True
+                    break
+        except Exception:
+            sample_has_complex = False
 
-        if frac_parsable >= 0.95:
-            # treat as numeric column
+        if sample_has_complex:
+            df2[col] = series.fillna("").apply(_to_json_safe)
+            continue
+
+        # 5) Numeric check: only accept numeric if ALL non-null values parse as numeric.
+        coerced = pd.to_numeric(series, errors="coerce")
+        non_null_mask = series.notna()
+        if non_null_mask.any():
+            all_non_null_parsable = coerced[non_null_mask].notna().all()
+        else:
+            all_non_null_parsable = False
+
+        if all_non_null_parsable:
             df2[col] = coerced
             continue
 
-        # Otherwise treat as text/categorical: replace NaN with empty string and cast to str
+        # 6) Otherwise convert to plain strings (no pd.NA, no objects)
         try:
-            df2[col] = series.fillna("").astype(str)
+            s = series.fillna("")
+            def _safe_str(x):
+                if pd.isna(x) or x == "":
+                    return ""
+                if isinstance(x, (list, dict, set)):
+                    return _to_json_safe(x)
+                return str(x)
+            df2[col] = s.apply(_safe_str)
         except Exception:
-            # Last-resort fallback: convert elementwise
             df2[col] = series.apply(lambda x: "" if pd.isna(x) else str(x))
 
-    # Final pass: ensure object columns have no NaNs
+    # Final pass: ensure object columns are safe strings and no pd.NA remain
     for c in df2.select_dtypes(include=["object"]).columns:
-        df2[c] = df2[c].fillna("")
+        try:
+            df2[c] = df2[c].fillna("").apply(lambda x: "" if pd.isna(x) else str(x))
+        except Exception:
+            df2[c] = df2[c].astype(str).fillna("")
 
-    return df2.reset_index(drop=True)
+    # Ensure index is a simple RangeIndex (avoid strange index objects)
+    try:
+        df2 = df2.reset_index(drop=True)
+    except Exception:
+        pass
 
+    return df2
+
+def display_df_for_streamlit(df: pd.DataFrame, max_rows: int | None = None) -> pd.DataFrame:
+    """
+    Prepare a DataFrame for display in Streamlit safely:
+    - Runs sanitize_df_for_display
+    - Forces every non-datetime column to plain Python strings (so Arrow won't try to convert to numeric)
+    - Optionally truncates rows for display
+    Returns the prepared DataFrame (which is safe to pass directly to st.dataframe)
+    """
+    if df is None:
+        return df
+    df_safe = sanitize_df_for_display(df)
+
+    # Optionally truncate (but leave original indexing intact) for speed
+    if max_rows is not None and len(df_safe) > max_rows:
+        df_safe = df_safe.head(max_rows)
+
+    # Convert non-datetime columns to strings (explicitly), avoiding 'nan' text
+    for c in df_safe.columns:
+        # Preserve datetime/timedelta columns as-is
+        if pd.api.types.is_datetime64_any_dtype(df_safe[c]) or pd.api.types.is_timedelta64_dtype(df_safe[c]):
+            continue
+        # Force to string and replace "nan" with ""
+        df_safe[c] = df_safe[c].apply(lambda x: "" if pd.isna(x) else str(x))
+
+    # As a last precaution ensure dtype is object for pyarrow
+    for c in df_safe.columns:
+        if not pd.api.types.is_datetime64_any_dtype(df_safe[c]) and not pd.api.types.is_timedelta64_dtype(df_safe[c]):
+            df_safe[c] = df_safe[c].astype(object)
+
+    return df_safe
 
 # -------------------------
 # Image discovery & descriptions
@@ -288,7 +359,7 @@ if mode == "Models info":
     st.header("Model metadata")
     md = model_metadata()
     df_md = pd.DataFrame(md) if md else pd.DataFrame(columns=["filename", "size_kb", "modified", "path"])
-    st.dataframe(sanitize_df_for_display(df_md))
+    st.dataframe(display_df_for_streamlit(df_md))
     st.write("Classifier loaded:", bool(clf_loaded))
     st.write("Score model loaded:", bool(scorer_loaded))
 
@@ -314,7 +385,8 @@ elif mode == "Single (WoE features)":
         with st.spinner("Running prediction..."):
             out = predict_from_features(inputs)
             st.success("Prediction complete")
-            out_display = sanitize_df_for_display(out)
+            out_display = display_df_for_streamlit(out)  # safe display wrapper
+            # show transposed display as before, but ensure it's safe (we convert everything to strings)
             st.dataframe(out_display.T)
 
 # -------------------------
@@ -332,24 +404,27 @@ elif mode == "Batch from CSV":
             st.error(f"Sample CSV not found at {SAMPLE_CSV}")
 
     if uploaded_file is not None:
-        if isinstance(uploaded_file, (str, bytes, BytesIO)):
+        try:
             df_raw = pd.read_csv(uploaded_file)
-        else:
-            df_raw = pd.read_csv(uploaded_file)
-        st.write("Raw data preview")
-        st.dataframe(sanitize_df_for_display(df_raw.head(10)))
+        except Exception as e:
+            st.error(f"Unable to read uploaded CSV: {e}")
+            df_raw = None
 
-        if st.button("Run batch prediction"):
-            with st.spinner("Running cleaning, feature engineering and predictions..."):
-                df_out = predict_from_transactions_csv(df_raw)
-                if df_out is None:
-                    st.error("Prediction pipeline failed (feature_engineering or data_cleaner not found).")
-                else:
-                    st.success("Batch prediction completed")
-                    df_out_display = sanitize_df_for_display(df_out)
-                    st.dataframe(df_out_display.head(50))
-                    csv = df_out.to_csv(index=False).encode("utf-8")
-                    st.download_button("Download predictions (CSV)", data=csv, file_name="predictions.csv", mime="text/csv")
+        if df_raw is not None:
+            st.write("Raw data preview")
+            st.dataframe(display_df_for_streamlit(df_raw.head(10), max_rows=10))
+
+            if st.button("Run batch prediction"):
+                with st.spinner("Running cleaning, feature engineering and predictions..."):
+                    df_out = predict_from_transactions_csv(df_raw)
+                    if df_out is None:
+                        st.error("Prediction pipeline failed (feature_engineering or data_cleaner not found).")
+                    else:
+                        st.success("Batch prediction completed")
+                        df_out_display = display_df_for_streamlit(df_out, max_rows=50)
+                        st.dataframe(df_out_display)
+                        csv = df_out.to_csv(index=False).encode("utf-8")
+                        st.download_button("Download predictions (CSV)", data=csv, file_name="predictions.csv", mime="text/csv")
 
 # Footer
 st.markdown("---")

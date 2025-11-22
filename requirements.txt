@@ -3,8 +3,8 @@ pandas
 numpy
 requests
 joblib
-scikit-learn==1.5.1
-scipy==1.12.0
+scikit-learn
+scipy
 pyarrow
 matplotlib
 seaborn
