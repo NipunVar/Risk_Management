@@ -1,17 +1,9 @@
-awscli
-black
-flake8
-ipython
-isort
-jupyterlab
-loguru
-matplotlib
-notebook
-numpy
-pandas
-pip
-python-dotenv
-scikit-learn
-tqdm
-typer
--e .
+streamlit==1.26.0
+pandas==2.3.3
+numpy==1.26.4
+scipy==1.13.1
+scikit-learn==1.5.1
+joblib==1.5.2
+requests==2.31.0
+pyarrow==14.0.1
+uvicorn==0.22.0
