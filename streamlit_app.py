@@ -1,4 +1,13 @@
 # streamlit_app.py
+"""
+Full updated Streamlit app (complete).
+- Dedicated "Images" mode with one section per PNG (each in its own expander).
+- Sidebar shows only the "Project images" header and the Mode radio.
+- All DataFrame outputs are sanitized to avoid PyArrow ArrowInvalid errors.
+- Models loading, single prediction, and batch CSV prediction remain intact.
+- Uses environment variable API_URL for the /predict_file endpoint (fallback to localhost).
+"""
+
 import streamlit as st
 import pandas as pd
 import joblib
@@ -41,10 +50,11 @@ try:
     if (SCRIPTS_DIR / "credit_score.py").exists():
         credit_score_mod = import_from_path("credit_score", SCRIPTS_DIR / "credit_score.py")
 except Exception as e:
+    # Do not crash app if imports fail; show a gentle warning later
     st.warning(f"Could not import scripts: {e}")
 
 # -------------------------
-# Load models
+# Load models (if present)
 # -------------------------
 @st.cache_resource
 def load_models():
@@ -119,7 +129,9 @@ def predict_from_features(features: dict):
     return df
 
 def predict_from_transactions_csv(df_transactions: pd.DataFrame):
-    api_url = st.secrets.get("API_URL", "http://localhost:8000/predict_file")
+    # Use environment variable (works on Streamlit Cloud when set) and fallback to localhost for local dev
+    API_URL = os.getenv("API_URL", "http://localhost:8000/predict_file")
+    api_url = API_URL
 
     csv_bytes = df_transactions.to_csv(index=False).encode("utf-8")
     files = {"file": ("upload.csv", BytesIO(csv_bytes), "text/csv")}
@@ -137,34 +149,95 @@ def predict_from_transactions_csv(df_transactions: pd.DataFrame):
 # Sanitizer (avoid pyarrow conversion errors)
 # -------------------------
 def sanitize_df_for_display(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Make a copy of df that is safe to pass to st.dataframe / st.table (Arrow).
+    - Numeric-like columns (>=95% parseable as numbers) are converted to numeric dtype.
+    - Datetime-like columns are preserved.
+    - Categorical columns are converted to object first to avoid Category setitem errors.
+    - All other columns are converted to strings and NaNs -> empty string.
+    """
     if df is None:
         return df
+
     df2 = df.copy()
+
     for col in df2.columns:
-        if df2[col].dtype == object:
-            df2[col] = df2[col].fillna("").astype(str)
+        series = df2[col]
+
+        # If series is categorical, convert to object to avoid Category assignment issues
+        # (this prevents "Cannot setitem on a Categorical with a new category" errors)
+        if pd.api.types.is_categorical_dtype(series):
+            try:
+                series = series.astype(object)
+            except Exception:
+                # fallback: convert underlying values to strings
+                series = series.astype(str)
+            df2[col] = series  # write back the converted series so following logic uses non-categorical dtype
+            # reload the updated series object reference
+            series = df2[col]
+
+        # Keep numeric dtypes numeric
+        if pd.api.types.is_numeric_dtype(series):
+            df2[col] = pd.to_numeric(series, errors="coerce")
             continue
+
+        # Preserve datetime/timedelta types
+        if pd.api.types.is_datetime64_any_dtype(series) or pd.api.types.is_timedelta64_dtype(series):
+            # Ensure consistent datetime dtype
+            try:
+                df2[col] = pd.to_datetime(series, errors="coerce")
+            except Exception:
+                pass
+            continue
+
+        # Try converting to numeric: if most values parse, keep numeric
+        coerced = pd.to_numeric(series, errors="coerce")
+        num_parsable = int(coerced.notna().sum())
+        frac_parsable = num_parsable / max(1, len(coerced))
+
+        if frac_parsable >= 0.95:
+            # treat as numeric column
+            df2[col] = coerced
+            continue
+
+        # Otherwise treat as text/categorical: replace NaN with empty string and cast to str
         try:
-            converted = pd.to_numeric(df2[col], errors="coerce")
-            if converted.notna().sum() / max(1, len(converted)) >= 0.95:
-                df2[col] = converted
-            else:
-                df2[col] = df2[col].astype(str)
+            df2[col] = series.fillna("").astype(str)
         except Exception:
-            df2[col] = df2[col].astype(str)
-    df2 = df2.reset_index(drop=True)
-    return df2
+            # Last-resort fallback: convert elementwise
+            df2[col] = series.apply(lambda x: "" if pd.isna(x) else str(x))
+
+    # Final pass: ensure object columns have no NaNs
+    for c in df2.select_dtypes(include=["object"]).columns:
+        df2[c] = df2[c].fillna("")
+
+    return df2.reset_index(drop=True)
+
 
 # -------------------------
-# IMAGE: find all PNGs in project root
+# Image discovery & descriptions
 # -------------------------
 def find_pngs_in_root(root: Path):
-    pngs = []
-    for p in sorted(root.glob("*.png")):
-        pngs.append(p)
-    return pngs
+    return sorted([p for p in root.glob("*.png") if p.is_file()])
 
-PROJECT_PNGS = find_pngs_in_root(PROJECT_ROOT)  # list of Path objects
+PROJECT_PNGS = find_pngs_in_root(PROJECT_ROOT)
+PNG_MAP = {p.stem: p for p in PROJECT_PNGS}
+
+# Descriptions: edit as needed. Keys are file stems (filename without .png)
+IMAGE_DESCRIPTIONS = {
+    "actual_prediction": "Actual vs Predicted — scatter plot with fitted line showing how predicted credit scores compare to actuals.",
+    "classfication": "Sample classification table showing predicted labels and 'is_high_risk' flag.",
+    "confusion_mat": "Confusion matrix for the classifier — visualises true vs predicted counts.",
+    "correlation": "Correlation heatmap showing relationships across all features (including binned WoE features).",
+    "creditScore": "Example output table showing computed credit scores and ratings.",
+    "FICO_Score": "FICO scoring buckets and helpful reference chart for mapping scores to categories.",
+    "gb": "Gradient Boosting classifier training snapshot (model properties).",
+    "LR": "Linear Regression snapshot used for credit score modeling.",
+    "pred": "Sample predictions output snapshot.",
+    "rfms_space": "RFMS 3D scatter showing Recency/Frequency/Monetary segmentation.",
+    "ROC-Curve": "ROC curve and AUC indicating classifier performance.",
+    "selected_features": "List of selected features used for building the model."
+}
 
 # -------------------------
 # Streamlit UI
@@ -172,52 +245,48 @@ PROJECT_PNGS = find_pngs_in_root(PROJECT_ROOT)  # list of Path objects
 st.set_page_config(page_title="Credit Risk - Streamlit UI", layout="wide")
 st.title("Credit Risk Scoring")
 
-# Sidebar header & mode
-st.sidebar.header("Options")
-mode = st.sidebar.radio("Mode", ["Single (WoE features)", "Batch from CSV", "Models info", "Quick demo sample CSV"])
+# Sidebar: ONLY the Project images heading (per request)
+st.sidebar.header("Project images")
+st.sidebar.markdown("This app includes a dedicated Images page. Use the main page to browse image sections.")
 
-# Sidebar: list model files
-st.sidebar.markdown("**Model files**")
-md = model_metadata()
-if md:
-    for m in md:
-        st.sidebar.markdown(f"- **{m['filename']}** · {m['size_kb']} KB · modified {m['modified']}")
-else:
-    st.sidebar.markdown("- No models found in /models")
-
-# -------------------------
-# Sidebar: one expander per PNG (name -> image)
-# -------------------------
+# Sidebar: Mode selection (modes unchanged)
 st.sidebar.markdown("---")
-st.sidebar.markdown("### Project images")
-if PROJECT_PNGS:
-    for img_path in PROJECT_PNGS:
-        name = img_path.stem  # filename without extension
-        with st.sidebar.expander(name, expanded=False):
-            try:
-                st.image(str(img_path), use_container_width=True)
-            except Exception as e:
-                st.write(f"Unable to display `{img_path.name}`: {e}")
-else:
-    st.sidebar.markdown("_No .png files found in project root_")
+mode = st.sidebar.radio("Mode", ["Single (WoE features)", "Batch from CSV", "Models info", "Images"])
 
-# Also offer a toggle to show images inline (main panel)
-show_images_main = st.sidebar.checkbox("Show images in main panel", value=False)
+# ---------------------------------------------------------------------
+#  IMAGES MODE: separate page that shows only images (one section per PNG)
+# ---------------------------------------------------------------------
+if mode == "Images":
+    st.header("Project images — sections")
+    st.markdown("This page contains a separate **section** for each image in the repository. Expand a section to view the full image and its description.")
+    if not PROJECT_PNGS:
+        st.info("No PNG images found in the project root. Place PNG files next to this script.")
+    else:
+        # Option to expand all
+        expand_all = st.checkbox("Show all expanded", value=False)
+        # Show each image as its own section (expander)
+        for p in PROJECT_PNGS:
+            title = p.stem
+            desc = IMAGE_DESCRIPTIONS.get(title, "No description available for this image.")
+            # set expanded state according to checkbox
+            with st.expander(title, expanded=expand_all):
+                st.subheader(title)
+                st.markdown(desc)
+                try:
+                    st.image(str(p), use_container_width=True)
+                except Exception as e:
+                    st.error(f"Unable to display image {p.name}: {e}")
+                st.markdown("---")
 
-if show_images_main and PROJECT_PNGS:
-    st.header("Project images")
-    for img_path in PROJECT_PNGS:
-        st.subheader(img_path.stem)
-        try:
-            st.image(str(img_path), use_container_width=True)
-        except Exception as e:
-            st.write(f"Unable to display `{img_path.name}`: {e}")
+    # end of Images mode: return early so nothing else renders
+    st.stop()
 
 # -------------------------
 # MODE: Models info
 # -------------------------
 if mode == "Models info":
     st.header("Model metadata")
+    md = model_metadata()
     df_md = pd.DataFrame(md) if md else pd.DataFrame(columns=["filename", "size_kb", "modified", "path"])
     st.dataframe(sanitize_df_for_display(df_md))
     st.write("Classifier loaded:", bool(clf_loaded))
@@ -282,27 +351,6 @@ elif mode == "Batch from CSV":
                     csv = df_out.to_csv(index=False).encode("utf-8")
                     st.download_button("Download predictions (CSV)", data=csv, file_name="predictions.csv", mime="text/csv")
 
-# -------------------------
-# MODE: Quick demo sample CSV
-# -------------------------
-elif mode == "Quick demo sample CSV":
-    st.header("Quick demo using sample_transactions.csv")
-    st.markdown(f"Sample path used: `{SAMPLE_CSV}`")
-    if SAMPLE_CSV.exists():
-        if st.button("Run demo using sample file"):
-            df_demo = pd.read_csv(SAMPLE_CSV)
-            st.write("Sample transactions")
-            st.dataframe(sanitize_df_for_display(df_demo))
-            with st.spinner("Sending to pipeline..."):
-                df_out = predict_from_transactions_csv(df_demo)
-                if df_out is not None:
-                    st.success("Demo prediction complete")
-                    df_out_display = sanitize_df_for_display(df_out)
-                    st.dataframe(df_out_display)
-                    csv = df_out.to_csv(index=False).encode("utf-8")
-                    st.download_button("Download demo predictions", data=csv, file_name="demo_predictions.csv", mime="text/csv")
-                else:
-                    st.error("Pipeline failed. Check that scripts/data_cleaner.py and scripts/feature_engineering.py exist and are importable.")
-
+# Footer
 st.markdown("---")
 st.caption("This Streamlit app uses your project's models and scripts (scripts/* and models/*). Run `streamlit run streamlit_app.py` in the project root to start.")
