@@ -119,7 +119,8 @@ def predict_from_features(features: dict):
     return df
 
 def predict_from_transactions_csv(df_transactions: pd.DataFrame):
-    api_url = "http://localhost:8000/predict_file"
+    api_url = st.secrets.get("API_URL", "http://localhost:8000/predict_file")
+
     csv_bytes = df_transactions.to_csv(index=False).encode("utf-8")
     files = {"file": ("upload.csv", BytesIO(csv_bytes), "text/csv")}
     try:
